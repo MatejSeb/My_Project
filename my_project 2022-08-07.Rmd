@@ -1,0 +1,845 @@
+---
+title: "GDP growth prediction"
+author: "Matej Sebenik"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Data download and preparation, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, results='hide',fig.keep='all'}
+# Install the required libraries and packages. The WDI library contains tools to effectively
+# Download and merge different tables, maintained by the World Bank, into one table.
+if(!require(WDI)) install.packages("WDI",repos = "http://cran.us.r-project.org")
+if(!require(tidyverse)) install.packages("tidyverse",repos = "http://cran.us.r-project.org")
+if(!require(randomForest)) install.packages("randomForest",repos = "http://cran.us.r-project.org")
+library("tidyverse")
+library("dplyr")
+library("caret")
+
+# This option forces R to display numbers in the full format (1000000 instead of 1*e6).
+options(scipen=999)
+
+#----
+# DATA PREPARATION
+
+# Download the relevant tables (annual GDP growth, unemployment rates, two inflation types, levels
+# Of government debt and savings levels, values of government reserves, account balance and external debt).
+# The function WDI:WDI also merges these separate tables into one convenient table, useful for further work.
+my_dataset = WDI::WDI(indicator = 
+                c("SL.UEM.TOTL.ZS", 
+                  "NY.GDP.MKTP.KD.ZG", 
+                  #"NY.GDP.PCAP.KD.ZG", 
+                  "NY.GDP.DEFL.KD.ZG", 
+                  "FP.CPI.TOTL.ZG",
+                  "GC.DOD.TOTL.GD.ZS",
+                  "NY.GNS.ICTR.ZS",
+                  "FI.RES.TOTL.CD", #current $
+                  "BN.CAB.XOKA.CD", #current $
+                  "DT.DOD.DECT.CD"), #current $
+              extra = TRUE)
+
+# Rename the columns. Ignore the growth per capita, as it is too closely related to the value we are
+# Predicting, which is "GDP_growth_per_capita".
+my_dataset_renamed = my_dataset %>% rename(., 
+                      unemployment_rate = SL.UEM.TOTL.ZS,
+                      GDP_growth_annual = NY.GDP.MKTP.KD.ZG,
+                      #GDP_growth_per_capita = NY.GDP.PCAP.KD.ZG,
+                      inflation_GDP_deflator = NY.GDP.DEFL.KD.ZG,
+                      inflation = FP.CPI.TOTL.ZG,
+                      govt_debt_share_of_gdp = GC.DOD.TOTL.GD.ZS,
+                      gross_savings_share_of_gdp = NY.GNS.ICTR.ZS,
+                      total_reserves = FI.RES.TOTL.CD,
+                      current_account_balance = BN.CAB.XOKA.CD,
+                      external_debt_stocks = DT.DOD.DECT.CD)
+
+# Review the created and renamed dataset.
+head(my_dataset_renamed)
+
+# View the number of rows available at the onset of the data preparation.
+nrow(my_dataset_renamed)
+no_at_beginning = nrow(my_dataset_renamed)
+
+# Economic troubles generally don't just appear out of the blue, but follow larger periods of poor
+# Economic performance. Thus, the following creates a parallel dataset, where the year value is
+# Increased by 1 and then merged back into the main dataset. So a value for 1990 is set to 1991
+# And then merged back into the main dataset, where the year 1991 contains the valus for 1991
+# (Original data) as well as the data for 1990 (previous year data, using the suffix _ly (last year)).
+my_dataset_renamed_year = my_dataset_renamed %>% mutate(year = year + 1)
+
+my_dataset_renamed_joined = merge(x = my_dataset_renamed, y = my_dataset_renamed_year,
+                                 by.x=c("country", "year"), by.y=c("country", "year"))
+
+# Review the renamed and joined dataset.
+head(my_dataset_renamed_joined)
+
+# We can see the data from the World Bank include data for entire regions, which is not something we want.
+# We want the data to reflect only the actual countries. Thus, we remove the data which do not have entries
+# For the capital city, making them regional data. In addition we recode the data for economic growth
+# (GDP_growth_annual.x), creating a column named economic downturn, which returns the value 1 for downturn
+# And 0 for growth or stagnation. This will be necessary later for classification methods.
+my_dataset_almost_final = my_dataset_renamed_joined %>% 
+  filter(capital.x != "") %>% 
+  mutate(economic_downturn = ifelse(GDP_growth_annual.x < 0, 1, 0)) %>% 
+  select(country, year, GDP_growth_annual.x, economic_downturn, unemployment_rate.x, unemployment_rate.y, GDP_growth_annual.y,
+         inflation_GDP_deflator.x, inflation_GDP_deflator.y, inflation.x, inflation.y,
+         govt_debt_share_of_gdp.x, govt_debt_share_of_gdp.y, gross_savings_share_of_gdp.x, gross_savings_share_of_gdp.y,
+         total_reserves.x, total_reserves.y, current_account_balance.x, current_account_balance.y,
+         external_debt_stocks.x, external_debt_stocks.y)
+
+# The countries have individual random numbers assigned to them. A developed country would potentially 
+# Achieve lower GDP growth given the same economic indicators as opposed to a developing country (having
+# Less room for growth than a developed country). Thus, all countries are not (statistically) equal, and
+# This will be taken into account in the algorithm development.
+countries_recoded = my_dataset_almost_final %>% select(country)
+distinct_country = distinct(countries_recoded)
+
+set.seed(1, sample.kind = "Rounding")
+distinct_country_numbers = data.frame(distinct_country, country_number = sample(seq(1, nrow(distinct_country), 1), nrow(distinct_country), replace = FALSE))
+distinct_country_numbers %>% arrange(country_number)
+
+my_dataset_final = merge(my_dataset_almost_final, distinct_country_numbers)
+
+# Certain of the used algorithms do not work with empty (NA value) cells. Thus, these are removed for each
+# Column, reducing the number of rows remaining drastically. This last operation completes the data
+# Preparation phase.
+my_dataset_final = my_dataset_final %>% 
+  filter(!is.na(economic_downturn) & !is.na(unemployment_rate.x) & !is.na(unemployment_rate.y) 
+         & !is.na(GDP_growth_annual.x) & !is.na(GDP_growth_annual.y) 
+         & !is.na(inflation_GDP_deflator.x) & !is.na(inflation_GDP_deflator.y)
+         & !is.na(inflation.x) & !is.na(inflation.y)
+         & !is.na(govt_debt_share_of_gdp.x) & !is.na(govt_debt_share_of_gdp.y) 
+         & !is.na(gross_savings_share_of_gdp.x) & !is.na(gross_savings_share_of_gdp.y)
+         & !is.na(total_reserves.x) & !is.na(total_reserves.y) 
+         & !is.na(current_account_balance.x) & !is.na(current_account_balance.y)
+         & !is.na(external_debt_stocks.x) & !is.na(external_debt_stocks.y))
+
+# Review the final dataset.
+head(my_dataset_final)
+
+# View the number of rows remaining after data preparation.
+nrow(my_dataset_final)
+no_at_end = nrow(my_dataset_final)
+```
+
+```{r Algorithm development, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, results='hide',fig.keep='all'}
+# Development of the algorithm
+
+# Create the test set and the validation set. Due to the limited number of rows remaining, We will
+# Allocate as many entries as possible to the train set (90 %) and as little as possible (10 %)
+# To the validation set. This should return an algorithm which will achieve better accuracy/RMSE,
+# At the threat of overtraining and with the added problem of lower validation accuracy (the lowest
+# 'step' for the validation accuracy will be cca. 2% (1/(10%*507))).
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = my_dataset_final$economic_downturn, 
+                                    times = 1, p = 0.1, list = FALSE)
+train_set <- my_dataset_final[-test_index,]
+validation_set <- my_dataset_final[test_index,]
+
+# Purge the memory and remove unnecessary stored tables and values.
+gc()
+rm(countries_recoded,distinct_country,distinct_country_numbers,my_dataset,my_dataset_almost_final,
+   my_dataset_renamed,my_dataset_renamed_joined,my_dataset_renamed_year,test_index)
+
+control <- trainControl(method = "cv", number = 7)
+
+# Below, the typical methods learned during the course will be used, both regressions and classifications.
+
+# Glm method
+# Set the random seed and train the algorithm
+set.seed(1, sample.kind = "Rounding")
+train_glm <- train(GDP_growth_annual.x ~ 
+                     +country
+                     +country_number
+                     +unemployment_rate.x
+                     +unemployment_rate.y
+                     +inflation_GDP_deflator.x 
+                     +inflation_GDP_deflator.y
+                     +inflation.x
+                     +inflation.y
+                     +govt_debt_share_of_gdp.x
+                     +govt_debt_share_of_gdp.y
+                     +gross_savings_share_of_gdp.x
+                     +gross_savings_share_of_gdp.y
+                     +total_reserves.x
+                     +total_reserves.y
+                     +current_account_balance.x
+                     +current_account_balance.y
+                     +external_debt_stocks.x
+                     +external_debt_stocks.y
+                     , method = "glm",
+                     na.action = na.pass,
+                     data = train_set
+                     ,trControl = control
+)
+# Look over the results
+train_glm
+# Round the value to 5 decimals
+RMSE_initial_glm = round(train_glm$results["RMSE"], 5)
+
+# Assess the initial RMSE
+RMSE_initial_glm
+
+# Run the algorithm on the validation data set to obtain the final RMSE.
+# Round the final validation RMSE, to 5 decimals.
+validation_prediction_glm = predict(train_glm, validation_set)
+RMSE_final_glm = round(RMSE(validation_prediction_glm, validation_set$GDP_growth_annual.x), 5)
+RMSE_final_glm
+
+# Calculate the accuracy of the given algorithm, defining the downturn as a negative
+# Projected or actual negative annual GDP growth.
+# Bind the projected validation and actual validation downturn values, compare them and calculate the final accuracy.
+accuracy_glm = round(data.frame(validation_prediction_glm) %>% 
+  mutate(predicted_economic_downturn_glm = ifelse(validation_prediction_glm < 0, 1, 0)) %>% 
+  cbind(actual = validation_set$economic_downturn) %>% 
+  select(predicted_economic_downturn_glm, actual) %>%
+  mutate(glm_same = ifelse(predicted_economic_downturn_glm == actual, 1, 0)) %>%
+  summarise(glm_final_accuracy = mean(glm_same)), 5)
+accuracy_glm
+
+# Create the table results, which will contain all the relevant results for each algorithm.
+# Input the glm values into the results table.
+glm_results = c("glm", "RMSE", RMSE_initial_glm, RMSE_final_glm, accuracy_glm)
+
+# Knn method
+# Set the random seed and train the algorithm
+set.seed(1, sample.kind = "Rounding")
+train_knn <- train(GDP_growth_annual.x ~ 
+                     +country
+                   +country_number
+                   +unemployment_rate.x
+                   +unemployment_rate.y
+                   +inflation_GDP_deflator.x 
+                   +inflation_GDP_deflator.y
+                   +inflation.x
+                   +inflation.y
+                   +govt_debt_share_of_gdp.x
+                   +govt_debt_share_of_gdp.y
+                   +gross_savings_share_of_gdp.x
+                   +gross_savings_share_of_gdp.y
+                   +total_reserves.x
+                   +total_reserves.y
+                   +current_account_balance.x
+                   +current_account_balance.y
+                   +external_debt_stocks.x
+                   +external_debt_stocks.y
+                   , method = "knn",
+                   na.action = na.pass,
+                   data = train_set
+                   ,trControl = control
+)
+# Look over the results
+train_knn
+# Round the value to 5 decimals
+RMSE_initial_knn = round(train_knn$results["RMSE"], 5)
+
+# The knn algorithm calculates the RMSEs for 3 numbers of k (5, 7 and 9).
+# The best RMSE is the result of k = 5, so that value is used further on.
+# The minimim value of the three initial RMSEs is designated the initial RMSE for the knn method.
+RMSE_initial_knn = min(RMSE_initial_knn)
+
+# Run the algorithm on the validation data set to obtain the final RMSE.
+# Round the final validation RMSE, to 5 decimals.
+validation_prediction_knn = predict(train_knn, validation_set)
+RMSE_final_knn = round(RMSE(validation_prediction_knn, validation_set$GDP_growth_annual.x), 5)
+RMSE_final_knn
+
+# Calculate the accuracy of the given algorithm, defining the downturn as a negative
+# Projected or actual negative annual GDP growth. 
+# Bind the projected validation and actual validation downturn values, compare them and calculate the final accuracy.
+accuracy_knn = round(data.frame(validation_prediction_knn) %>% 
+  mutate(predicted_economic_downturn_knn = ifelse(validation_prediction_knn < 0, 1, 0)) %>% 
+  cbind(actual = validation_set$economic_downturn) %>% 
+  select(predicted_economic_downturn_knn, actual) %>%
+  mutate(knn_same = ifelse(predicted_economic_downturn_knn == actual, 1, 0)) %>%
+  summarise(knn_final_accuracy = mean(knn_same)), 5)
+accuracy_knn
+
+# Input the knn values into the results table.
+knn_results = c("knn", "RMSE", RMSE_initial_knn, RMSE_final_knn, accuracy_knn)
+
+results = rbind(glm_results, knn_results)
+results
+
+# GamLoess method
+# Set the random seed and train the algorithm
+set.seed(1, sample.kind = "Rounding")
+train_gamLoess <- train(GDP_growth_annual.x ~ 
+                     +country
+                   +country_number
+                   +unemployment_rate.x
+                   +unemployment_rate.y
+                   +inflation_GDP_deflator.x 
+                   +inflation_GDP_deflator.y
+                   +inflation.x
+                   +inflation.y
+                   +govt_debt_share_of_gdp.x
+                   +govt_debt_share_of_gdp.y
+                   +gross_savings_share_of_gdp.x
+                   +gross_savings_share_of_gdp.y
+                   +total_reserves.x
+                   +total_reserves.y
+                   +current_account_balance.x
+                   +current_account_balance.y
+                   +external_debt_stocks.x
+                   +external_debt_stocks.y
+                   , method = "gamLoess",
+                   na.action = na.pass,
+                   data = train_set
+                   ,trControl = control
+)
+# Look over the results
+train_gamLoess
+
+# Disregard the result of the RMSE returned above, calculate the correct RMSE by predicting
+# The algorithm back on the train set.
+set.seed(1, sample.kind = "Rounding")
+predict_loess_check = predict(train_gamLoess, train_set)
+RMSE_initial_gamLoess = round(RMSE(predict_loess_check, train_set$GDP_growth_annual.x), 5)
+
+# Run the algorithm on the validation data set to obtain the final RMSE.
+# Round the final validation RMSE, to 5 decimals.
+validation_prediction_gamLoess = predict(train_gamLoess, validation_set)
+RMSE_final_gamLoess = round(RMSE(validation_prediction_gamLoess, validation_set$GDP_growth_annual.x), 5)
+RMSE_final_gamLoess
+
+# Calculate the accuracy of the given algorithm, defining the downturn as a negative
+# Projected or actual negative annual GDP growth. 
+# Bind the projected validation and actual validation downturn values, compare them and calculate the final accuracy.
+accuracy_gamLoess = round(data.frame(validation_prediction_gamLoess) %>% 
+  mutate(predicted_economic_downturn_gamLoess = ifelse(validation_prediction_gamLoess < 0, 1, 0)) %>% 
+  cbind(actual = validation_set$economic_downturn) %>% 
+  select(predicted_economic_downturn_gamLoess, actual) %>%
+  mutate(gamLoess_same = ifelse(predicted_economic_downturn_gamLoess == actual, 1, 0)) %>%
+  summarise(gamLoess_final_accuracy = mean(gamLoess_same)), 5)
+accuracy_gamLoess
+
+# Input the gamLoess values into the results table.
+gamLoess_results = c("gamLoess", "RMSE", RMSE_initial_gamLoess, RMSE_final_gamLoess, accuracy_gamLoess)
+
+results = rbind(results, gamLoess_results)
+results
+
+# Lda method
+# Set the random seed and train the algorithm
+set.seed(1, sample.kind = "Rounding")
+train_lda <- train(as.character(economic_downturn) ~ 
+                          +country
+                        +country_number
+                        +unemployment_rate.x
+                        +unemployment_rate.y
+                        +inflation_GDP_deflator.x 
+                        +inflation_GDP_deflator.y
+                        +inflation.x
+                        +inflation.y
+                        +govt_debt_share_of_gdp.x
+                        +govt_debt_share_of_gdp.y
+                        +gross_savings_share_of_gdp.x
+                        +gross_savings_share_of_gdp.y
+                        +total_reserves.x
+                        +total_reserves.y
+                        +current_account_balance.x
+                        +current_account_balance.y
+                        +external_debt_stocks.x
+                        +external_debt_stocks.y
+                        , method = "lda"
+                        ,na.action = na.pass
+                        ,data = train_set
+                        ,trControl = control
+)
+# Look over the results
+train_lda
+accuracy_initial_lda = round(train_lda$results["Accuracy"], 5)
+
+# Run the algorithm on the validation data set to obtain the final accuracy.
+# Round the final validation accuracy, to 5 decimals.
+validation_prediction_lda = predict(train_lda, validation_set)
+accuracy_final_lda = round(mean(validation_prediction_lda == validation_set$economic_downturn), 5)
+accuracy_final_lda
+
+# Input the lda values into the results table. 
+# For classification methods the validation and final accuracies are the same.
+lda_results = c("lda", "accuracy", accuracy_initial_lda, accuracy_final_lda, accuracy_final_lda)
+
+results = rbind(results, lda_results)
+results
+
+# # Qda method - returns a bizzare error, no idea why, ignore the method and be content with lda.
+# # Set the random seed and train the algorithm
+# set.seed(1, sample.kind = "Rounding")
+# train_qda <- train(as.character(economic_downturn) ~ 
+#                      +country
+#                    +country_number
+#                    +unemployment_rate.x
+#                    +unemployment_rate.y
+#                    +inflation_GDP_deflator.x 
+#                    +inflation_GDP_deflator.y
+#                    +inflation.x
+#                    +inflation.y
+#                    +govt_debt_share_of_gdp.x
+#                    +govt_debt_share_of_gdp.y
+#                    +gross_savings_share_of_gdp.x
+#                    +gross_savings_share_of_gdp.y
+#                    +total_reserves.x
+#                    +total_reserves.y
+#                    +current_account_balance.x
+#                    +current_account_balance.y
+#                    +external_debt_stocks.x
+#                    +external_debt_stocks.y
+#                    ,method = "qda"
+#                    #,tuneGrid = grid
+#                    #,na.action = na.pass
+#                    ,data = train_set
+#                    #,trControl = trainControl(method = "cv", number = 1)
+# )
+# # Look over the results
+# train_qda
+# accuracy_initial_qda = round(train_qda$results["Accuracy"], 5)
+# 
+# # Run the algorithm on the validation data set to obtain the final accuracy.
+# # Round the final validation accuracy, to 5 decimals.
+# validation_prediction_qda = predict(train_qda, validation_set)
+# accuracy_final_qda = round(mean(validation_prediction_qda == validation_set$economic_downturn), 5)
+# accuracy_final_qda
+# 
+# # Input the qda values into the results table. 
+# # For classification methods the validation and final accuracies are the same.
+# qda_results = c("qda", "accuracy", accuracy_initial_qda, accuracy_final_qda, accuracy_final_qda)
+# 
+# results = rbind(results, qda_results)
+# results
+
+# Decision tree method
+# Set the random seed and train the algorithm
+set.seed(1, sample.kind = "Rounding")
+train_rpart <- train(as.character(economic_downturn) ~ 
+                     +country
+                   +country_number
+                   +unemployment_rate.x
+                   +unemployment_rate.y
+                   +inflation_GDP_deflator.x 
+                   +inflation_GDP_deflator.y
+                   +inflation.x
+                   +inflation.y
+                   +govt_debt_share_of_gdp.x
+                   +govt_debt_share_of_gdp.y
+                   +gross_savings_share_of_gdp.x
+                   +gross_savings_share_of_gdp.y
+                   +total_reserves.x
+                   +total_reserves.y
+                   +current_account_balance.x
+                   +current_account_balance.y
+                   +external_debt_stocks.x
+                   +external_debt_stocks.y
+                   , method = "rpart"
+                   ,na.action = na.pass
+                   ,data = train_set
+                   ,trControl = control
+)
+# Look over the results
+train_rpart
+# The calculation uses three different complexity parameters to decide on the best algorithm version.
+# The one returning the highest accuracy is used.
+accuracy_initial_rpart = round(max(train_rpart$results["Accuracy"]), 5)
+
+# Run the algorithm on the validation data set to obtain the final accuracy.
+# Round the final validation accuracy, to 5 decimals.
+validation_prediction_rpart = predict(train_rpart, validation_set)
+accuracy_final_rpart = round(mean(validation_prediction_rpart == validation_set$economic_downturn), 5)
+accuracy_final_rpart
+
+# Input the rpart values into the results table. 
+# For classification methods the validation and final accuracies are the same.
+rpart_results = c("decision tree", "accuracy", accuracy_initial_rpart, accuracy_final_rpart, accuracy_final_rpart)
+
+results = rbind(results, rpart_results)
+results
+
+# Random forest method
+# Set the random seed and train the algorithm
+set.seed(1, sample.kind = "Rounding")
+train_rf <- train(as.character(economic_downturn) ~ 
+                       +country
+                     +country_number
+                     +unemployment_rate.x
+                     +unemployment_rate.y
+                     +inflation_GDP_deflator.x 
+                     +inflation_GDP_deflator.y
+                     +inflation.x
+                     +inflation.y
+                     +govt_debt_share_of_gdp.x
+                     +govt_debt_share_of_gdp.y
+                     +gross_savings_share_of_gdp.x
+                     +gross_savings_share_of_gdp.y
+                     +total_reserves.x
+                     +total_reserves.y
+                     +current_account_balance.x
+                     +current_account_balance.y
+                     +external_debt_stocks.x
+                     +external_debt_stocks.y
+                     , method = "rf"
+                     ,na.action = na.pass
+                     ,data = train_set
+                     ,trControl = control
+)
+# Look over the results
+train_rf
+# The calculation uses three different mtry parameters (numbers of variables sampled at each split) 
+# To decide on the best algorithm version.
+# The one returning the highest accuracy is used.
+accuracy_initial_rf = round(max(train_rf$results["Accuracy"]), 5)
+
+# Run the algorithm on the validation data set to obtain the final accuracy.
+# Round the final validation accuracy, to 5 decimals.
+validation_prediction_rf = predict(train_rf, validation_set)
+accuracy_final_rf = round(mean(validation_prediction_rf == validation_set$economic_downturn), 5)
+accuracy_final_rf
+
+# Input the rf values into the results table. 
+# For classification methods the validation and final accuracies are the same.
+rf_results = c("random forest", "accuracy", accuracy_initial_rf, accuracy_final_rf, accuracy_final_rf)
+
+results = rbind(results, rf_results)
+colnames(results) = c('algorithm_name','initial_metric','test_value','validation_value','validation_accuracy')
+results
+```
+
+
+***1. Introduction:***  
+The goal of this paper is the creation of a predictive algorithm, based on the economic data form the World Bank, that will predict if the economy of any given country any given year is in a downturn (defined as having negative annual GDP growth). The metric used to evaluate the algorithm is accuracy. In absence of official accuracy targets, a success rate of at least 75% will be considered fine, and a success rate of 90% or more will be considered excellent.
+
+The data set is available at [**this link**](https://data.worldbank.org/indicator).
+
+Key steps in the calculation of the predictive algorithm are as follows:  
+1. Data set download, preparation and data cleaning.  
+2. Data visualizations.  
+3. Algorithm training and verification. 
+\newpage
+The data set, after all the relevant data manipulation, is previewed below:
+```{r head of my_dataset_final, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, fig.keep='all'}
+head(my_dataset_final)
+```
+\newpage
+***2. Data description:***  
+The data set is divided into 22 columns. These contain:  
+1. The name of the country.  
+2. The year of the value.  
+3. GDP_growth_annual.x contains the annual GDP growth for that year, in percent.  
+4. Economic_downturn is the previous column, recoded so that any negative annual GDP growth returns 1, and stagnation or positive growth returns 0. This column is necessary for the classification part of
+the algorithm development.  
+5. Unemployment_rate.x returns that year's unemployment rate, in percent.  
+6. Unemployment_rate.y returns the previous year's unemployment rate, in percent.  
+7. GDP_growth_annual.y returns the previous year's annual GDP growth, in percent. This value is not actually used anywhere, due to very high correlation with the primary annual GDP growth.  
+8. Inflation_GDP_deflator.x returns the inflation for the entire economy, for that year, in percent.  
+9. Inflation_GDP_deflator.y returns the inflation for the entire economy, for previous year, in percent.       
+10. Inflation.x returns the inflation for a fixed basket of goods, for that year, in percent.  
+11. Inflation.y returns the inflation for a fixed basket of goods, for previous year, in percent.  
+12. Govt_debt_share_of_gdp.x returns the size of government's debt, for that year, in percent.  
+13. Govt_debt_share_of_gdp.y returns the size of government's debt, for previous year, in percent.  
+14. Gross_savings_share_of_gdp.x returns the size of savings in a country, for that year, in percent.  
+15. Gross_savings_share_of_gdp.y returns the size of savings in a country, for previous year, in percent.    
+16. Total_reserves.x returns the size of government's reserves, for that year, in USD.     
+17. Total_reserves.y returns the size of government's reserves, for previous year, in USD.       
+18. Current_account_balance.x returns the balance of a country's cash outflows/inflows, for that year, in USD.      
+19. Current_account_balance.y returns the balance of a country's cash outflows/inflows, for previous year, in USD.      
+20. External_debt_stocks.x returns the amount owned to foreign subjects, for that year, in USD.      
+21. External_debt_stocks.y returns the amount owned to foreign subjects, for previous year, in USD.  
+22. Country_number is a unique numeric identifier of any given country.  
+
+The data set has `r nrow(my_dataset_final)` entries/rows.
+\newpage
+***3. Data visualizations:***  
+Several data visualizations were prepared, with the aim of getting acquainted with the data. These visualizations are provided below, along with the relevant descriptions and insights.
+
+1. GDP growth annual vs. unemployment rate:
+
+```{r GDP growth annual vs. unemployment rate, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, fig.keep='all'}
+# GDP growth annual vs. unemployment rate according to the year of measurement.
+# The code below draws the combo graph, which has different values on each y axis. The axis and
+# lines are colored the same color, so that we can recognize which is which.
+
+# There appears a relevant correlation between the two values, with the unemployment rising when
+# GDP growth is low or negative, though this trend is somewhat spoiled from about 2003 on, where
+# The values appear to move in tandem.
+unemployment_coeff = my_dataset_final %>% group_by(year) %>%
+  summarise(mean_gdp_growth = mean(GDP_growth_annual.x), mean_unemployment = mean(unemployment_rate.x))
+unemployment_coeff = max(unemployment_coeff$mean_gdp_growth)/max(unemployment_coeff$mean_unemployment)
+
+my_dataset_final %>% group_by(year) %>%
+  summarise(mean_GDP_growth_annual = mean(GDP_growth_annual.x), mean_unemployment = mean(unemployment_rate.x)) %>%
+  ggplot(aes(x = year, group = 1)) +
+  geom_line(aes(y = mean_GDP_growth_annual), col="blue") +
+  geom_line(aes(y = mean_unemployment*unemployment_coeff), col="red") +
+  scale_y_continuous(name = "Mean GDP growth annual", sec.axis = sec_axis(~./unemployment_coeff, name="Mean unemployment")) +
+  ggtitle("Mean GDP growth annual vs. mean unemployment per year") +
+  xlab("Year") +
+  theme(axis.title.y.left=element_text(color="blue"),
+        axis.text.y.left=element_text(color="blue"),
+        axis.title.y.right=element_text(color="red"),
+        axis.text.y.right=element_text(color="red"))
+```
+
+This graph shows the value of annual GDP growth vs. unemployment rate.
+There appears a relevant correlation between the two values, with the unemployment rising when GDP growth is low or negative, though this trend is somewhat spoiled from about 2003 on, where the values appear to move in tandem.
+\newpage
+2. GDP growth annual vs. inflation GDP deflator:
+
+```{r GDP growth annual vs. inflation GDP deflator, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, fig.keep='all'}
+# GDP growth annual vs. inflation GDP deflator according to the year of measurement.
+# The code below draws the combo graph, which has different values on each y axis. The axis and
+# lines are colored the same color, so that we can recognize which is which.
+
+# The values again appear to move opposite to one another, with high inflation GDP deflator 
+# associated with low GDP growth. As with the previous graph, this relationship appears to 
+# break down with the economic Crisis of the late 2010s, and is only reestablished with the 
+# last data points, for 2016.
+deflator_coeff = my_dataset_final %>% group_by(year) %>%
+  summarise(mean_gdp_growth = mean(GDP_growth_annual.x), mean_deflator = mean(inflation_GDP_deflator.x))
+deflator_coeff = max(deflator_coeff$mean_gdp_growth)/max(deflator_coeff$mean_deflator)
+
+my_dataset_final %>% group_by(year) %>%
+  summarise(mean_GDP_growth_annual = mean(GDP_growth_annual.x), mean_infl_GDP_defl = mean(inflation_GDP_deflator.x)) %>%
+  ggplot(aes(x = year, group = 1)) +
+  geom_line(aes(y = mean_GDP_growth_annual), col="blue") +
+  geom_line(aes(y = mean_infl_GDP_defl*deflator_coeff), col="red") +
+  scale_y_continuous(name = "Mean GDP growth annual", sec.axis = sec_axis(~./deflator_coeff, name="Mean inflation GDP deflator")) +
+  ggtitle("Mean GDP growth annual vs. Mean inflation GDP deflator") +
+  xlab("Year") +
+  theme(axis.title.y.left=element_text(color="blue"),
+        axis.text.y.left=element_text(color="blue"),
+        axis.title.y.right=element_text(color="red"),
+        axis.text.y.right=element_text(color="red"))
+```
+
+This graph shows the value of annual GDP growth vs. inflation GDP deflator.
+The values again appear to move opposite to one another, with high inflation GDP deflator associated with low GDP growth. As with the previous graph, this relationship appears to break down with the economic crisis of the late 2010s, and is only reestablished with the last data points, for 2016.
+\newpage
+3. GDP growth annual vs. inflation:
+
+```{r GDP growth annual vs. inflation, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, fig.keep='all'}
+# GDP growth annual vs. inflation according to the year of measurement.
+# The code below draws the combo graph, which has different values on each y axis. The axis and
+# lines are colored the same color, so that we can recognize which is which.
+
+# This graph is very similar to the previous one, since the inflation and inflation GDP deflator are
+# Closely related to one another. Again we see the inverse movement of the two values up to 2009,
+# With the inversion dissapearing for the following 5 years.
+inflation_coeff = my_dataset_final %>% group_by(year) %>%
+  summarise(mean_gdp_growth = mean(GDP_growth_annual.x), mean_inflation = mean(inflation.x))
+inflation_coeff = max(inflation_coeff$mean_gdp_growth)/max(inflation_coeff$mean_inflation)
+
+my_dataset_final %>% group_by(year) %>%
+  summarise(mean_GDP_growth_annual = mean(GDP_growth_annual.x), mean_inflation = mean(inflation.x)) %>%
+  ggplot(aes(x = year, group = 1)) +
+  geom_line(aes(y = mean_GDP_growth_annual), col="blue") +
+  geom_line(aes(y = mean_inflation*inflation_coeff), col="red") +
+  scale_y_continuous(name = "Mean GDP growth annual", sec.axis = sec_axis(~./inflation_coeff, name="Mean inflation")) +
+  ggtitle("Mean GDP growth annual vs. Mean inflation") +
+  xlab("Year") +
+  theme(axis.title.y.left=element_text(color="blue"),
+        axis.text.y.left=element_text(color="blue"),
+        axis.title.y.right=element_text(color="red"),
+        axis.text.y.right=element_text(color="red"))
+```
+
+This graph shows the value of annual GDP growth vs. inflation.
+This graph is very similar to the previous one, since the inflation and inflation GDP deflator are closely related to one another. Again we see the inverse movement of the two values up to 2009, with the inversion dissapearing for the following several years.
+\newpage
+4. GDP growth annual vs. government debt as share of GDP:
+
+```{r GDP growth annual vs. government debt as share of GDP, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, fig.keep='all'}
+# GDP growth annual vs. government debt as share of GDP according to the year of measurement.
+# The code below draws the combo graph, which has different values on each y axis. The axis and
+# lines are colored the same color, so that we can recognize which is which.
+
+# The two values on display generally mirror each other, which is odd (low GDP growth should cause
+# grater levels of government debt?). Just before the crisis the two lines diverge, which makes sense.
+# Oddly, during the crisis, debt increases only marginally, and then slowly rises through the uneven
+# Economic recovery following.
+debt_coeff = my_dataset_final %>% group_by(year) %>%
+  summarise(mean_gdp_growth = mean(GDP_growth_annual.x), mean_debt = mean(govt_debt_share_of_gdp.x))
+debt_coeff = max(debt_coeff$mean_gdp_growth)/max(debt_coeff$mean_debt)
+
+my_dataset_final %>% group_by(year) %>%
+  summarise(mean_GDP_growth_annual = mean(GDP_growth_annual.x), mean_govt_debt_share_of_gdp = mean(govt_debt_share_of_gdp.x)) %>%
+  ggplot(aes(x = year, group = 1)) +
+  geom_line(aes(y = mean_GDP_growth_annual), col="blue") +
+  geom_line(aes(y = mean_govt_debt_share_of_gdp*debt_coeff), col="red") +
+  scale_y_continuous(name = "Mean GDP growth annual", sec.axis = sec_axis(~./debt_coeff, name="Mean government debt as share of GDP")) +
+  ggtitle("Mean GDP growth annual vs. Mean government debt as share of GDP") +
+  xlab("Year") +
+  theme(axis.title.y.left=element_text(color="blue"),
+        axis.text.y.left=element_text(color="blue"),
+        axis.title.y.right=element_text(color="red"),
+        axis.text.y.right=element_text(color="red"))
+```
+
+This graph shows the value of annual GDP growth vs. government debt as share of GDP.
+The two values on display generally mirror each other, which is odd (low GDP growth should cause grater levels of government debt?). Just before the crisis the two lines diverge, which makes sense. Oddly, during the crisis, debt increases only marginally, and then slowly rises through the uneven economic recovery following.
+\newpage
+5. GDP growth annual vs. savings as share of GDP:
+
+```{r GDP growth annual vs. savings as share of GDP, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, fig.keep='all'}
+# GDP growth annual vs. savings as share of GDP according to the year of measurement.
+# The code below draws the combo graph, which has different values on each y axis. The axis and
+# lines are colored the same color, so that we can recognize which is which.
+
+# The two values neatly follow each other. when GDP grows, so do the savings in a society, and vice versa.
+savings_coeff = my_dataset_final %>% group_by(year) %>%
+  summarise(mean_gdp_growth = mean(GDP_growth_annual.x), mean_savings = mean(gross_savings_share_of_gdp.x))
+savings_coeff = max(savings_coeff$mean_gdp_growth)/max(savings_coeff$mean_savings)
+
+my_dataset_final %>% group_by(year) %>%
+  summarise(mean_GDP_growth_annual = mean(GDP_growth_annual.x), mean_gross_savings_share_of_gdp = mean(gross_savings_share_of_gdp.x)) %>%
+  ggplot(aes(x = year, group = 1)) +
+  geom_line(aes(y = mean_GDP_growth_annual), col="blue") +
+  geom_line(aes(y = mean_gross_savings_share_of_gdp*savings_coeff), col="red") +
+  scale_y_continuous(name = "Mean GDP growth annual", sec.axis = sec_axis(~./savings_coeff, name="Mean gross savings as share of GDP")) +
+  ggtitle("Mean GDP growth annual vs. Mean gross savings as share of GDP") +
+  xlab("Year") +
+  theme(axis.title.y.left=element_text(color="blue"),
+        axis.text.y.left=element_text(color="blue"),
+        axis.title.y.right=element_text(color="red"),
+        axis.text.y.right=element_text(color="red"))
+```
+
+This graph shows the value of annual GDP growth vs. savings as share of GDP.
+The two values neatly follow each other. When GDP grows, so do the savings in a society, and vice versa.
+\newpage
+6. GDP growth annual vs. total reserves:
+
+```{r GDP growth annual vs. total reserves, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, fig.keep='all'}
+# GDP growth annual vs. total reserves according to the year of measurement.
+# The code below draws the combo graph, which has different values on each y axis. The axis and
+# lines are colored the same color, so that we can recognize which is which.
+
+# The values in this graph are confusing, as they indicate a massive jump in the absolute value of
+# Reserves just before the crisis. In fact, this is due to the fact that the values for several 
+# Large economies (Russian Federation, Indonesia, Brasil) only appear during this period, massively
+# Increasing the mean values displayed in the graph. After the crisis, the values behave more logically,
+# falling with the reduced economic activity.
+reserves_coeff = my_dataset_final %>% group_by(year) %>%
+  summarise(mean_gdp_growth = mean(GDP_growth_annual.x), mean_reserves = mean(total_reserves.x))
+reserves_coeff = max(reserves_coeff$mean_gdp_growth)/max(reserves_coeff$mean_reserves)
+
+my_dataset_final %>% group_by(year) %>%
+  summarise(mean_GDP_growth_annual = mean(GDP_growth_annual.x), mean_total_reserves = mean(total_reserves.x)) %>%
+  ggplot(aes(x = year, group = 1)) +
+  geom_line(aes(y = mean_GDP_growth_annual), col="blue") +
+  geom_line(aes(y = mean_total_reserves*reserves_coeff), col="red") +
+  scale_y_continuous(name = "Mean GDP growth annual", sec.axis = sec_axis(~./reserves_coeff, name="Mean total reserves")) +
+  ggtitle("Mean GDP growth annual vs. Mean total reserves") +
+  xlab("Year") +
+  theme(axis.title.y.left=element_text(color="blue"),
+        axis.text.y.left=element_text(color="blue"),
+        axis.title.y.right=element_text(color="red"),
+        axis.text.y.right=element_text(color="red"))
+```
+
+This graph shows the value of annual GDP growth vs. total reserves.
+The values in this graph are confusing, as they indicate a massive jump in the absolute value of reserves just before the crisis. In fact, this is due to the fact that the values for several large economies (Russian Federation, Indonesia, Brasil) only appear during this period, massively increasing the mean values displayed in the graph. After the crisis, the values behave more logically, falling with the reduced economic activity.
+\newpage
+7. GDP growth annual vs. current account balance:
+
+```{r GDP growth annual vs. current account balance, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, fig.keep='all'}
+# GDP growth annual vs. current account balance according to the year of measurement.
+# The code below draws the combo graph, which has different values on each y axis. The axis and
+# lines are colored the same color, so that we can recognize which is which.
+
+# Due to the nature of the current account balance, a correlation between the two values is not to be
+# Expected. Current account balance is a measure of the flow of money into or out of a given country.
+# If we had the perfect data for the entire planet, the mean value of the current account balance would
+# Always be zero, as each dollar that goes out of one country enters another country.
+# Given that we do not actually have perfect data, an in depth analysis shows that the appearance of
+# The Russian Federation massively boosts the value before the crisis (the country being a massive)
+# Exporter of oil and gas. Afterwards, The huge importers Brasil and India drag the value down.
+current_account_balance_coeff = my_dataset_final %>% group_by(year) %>%
+  summarise(mean_gdp_growth = mean(GDP_growth_annual.x), mean_current_account_balance = mean(current_account_balance.x))
+current_account_balance_coeff = max(current_account_balance_coeff$mean_gdp_growth)/max(current_account_balance_coeff$mean_current_account_balance)
+
+my_dataset_final %>% group_by(year) %>%
+  summarise(mean_GDP_growth_annual = mean(GDP_growth_annual.x), mean_current_account_balance = mean(current_account_balance.x)) %>%
+  ggplot(aes(x = year, group = 1)) +
+  geom_line(aes(y = mean_GDP_growth_annual), col="blue") +
+  geom_line(aes(y = mean_current_account_balance*current_account_balance_coeff), col="red") +
+  scale_y_continuous(name = "Mean GDP growth annual", sec.axis = sec_axis(~./current_account_balance_coeff, name="Mean current account balance")) +
+  ggtitle("Mean GDP growth annual vs. Mean current account balance") +
+  xlab("Year") +
+  theme(axis.title.y.left=element_text(color="blue"),
+        axis.text.y.left=element_text(color="blue"),
+        axis.title.y.right=element_text(color="red"),
+        axis.text.y.right=element_text(color="red"))
+```
+
+This graph shows the value of annual GDP growth vs. current account balance.
+Due to the nature of the current account balance, a correlation between the two values is not to be expected. Current account balance is a measure of the flow of money into or out of a given country. If we had the perfect data for the entire planet, the mean value of the current account balance would always be zero, as each dollar that goes out of one country enters another country. Given that we do not actually have perfect data, an in depth analysis shows that the appearance of the Russian Federation hugely boosts the value before the crisis (the country being a massive exporter of oil and gas). Afterwards, the large importers Brasil and India drag the value down.
+\newpage
+8. GDP growth annual vs. external debt:
+
+```{r GDP growth annual vs. external debt, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, fig.keep='all'}
+# GDP growth annual vs. external debt according to the year of measurement.
+# The code below draws the combo graph, which has different values on each y axis. The axis and
+# lines are colored the same color, so that we can recognize which is which.
+
+# Similarly, this graph reflects the inclusion of the Russian Federation, Brasil and Indonesia
+# In the mid 2010s. Even without these three outliers, the debt still increases with years.
+external_debt_coeff = my_dataset_final %>% group_by(year) %>%
+  summarise(mean_gdp_growth = mean(GDP_growth_annual.x), mean_external_debt = mean(external_debt_stocks.x))
+external_debt_coeff = max(external_debt_coeff$mean_gdp_growth)/max(external_debt_coeff$mean_external_debt)
+
+my_dataset_final %>% group_by(year) %>%
+  summarise(mean_GDP_growth_annual = mean(GDP_growth_annual.x), mean_external_debt = mean(external_debt_stocks.x)) %>%
+  ggplot(aes(x = year, group = 1)) +
+  geom_line(aes(y = mean_GDP_growth_annual), col="blue") +
+  geom_line(aes(y = mean_external_debt*external_debt_coeff), col="red") +
+  scale_y_continuous(name = "Mean GDP growth annual", sec.axis = sec_axis(~./external_debt_coeff, name="Mean external debt")) +
+  ggtitle("Mean GDP growth annual vs. Mean external debt") +
+  xlab("Year") +
+  theme(axis.title.y.left=element_text(color="blue"),
+        axis.text.y.left=element_text(color="blue"),
+        axis.title.y.right=element_text(color="red"),
+        axis.text.y.right=element_text(color="red"))
+```
+
+This graph shows the value of annual GDP growth vs. external debt.
+Similarly to previous entries, this graph reflects the inclusion of the Russian Federation, Brasil and Indonesia in the mid 2010s. Even without these three outliers, the debt still increases with years.
+\newpage
+***4. Modelling approach and results:***  
+**4.1. Modelling approach:**  
+The goal of the algorithm is to predict if the economy of a country in a year is in a downturn, defined as a negative annual GDP growth. The metric used to evaluate regression models, RMSE, will be transformed into accuracy, so that a comparison with the classification methods can be implemented.
+
+The most popular regression types were tested, these being the general linear model, localized regression and the k nearest neighbor method. Additionally, from the family of classifications, lda, decision tree and random forest algorithms were tested. Qda algorithm was discarded due to various errors. All the results were imputed into a single overview table.
+
+The data set was not further divided into training and test sets. Instead, cross validation was used for initial model evaluation. Spans and degrees were not regulated.
+
+The column GDP_growth_annual.y (which means previous year's GDP annual growth) was not used in algorithms, since it is too closely related to current year's GDP annual growth.
+
+**4.2. Results:**
+```{r results table, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, fig.keep='all'}
+results
+```
+
+The validation (final) accuracy shows that all the algorithms achieve the accuracy above 75 %, and thus can be considered fine. None are better than 90 %, and so none can be considered excellent. The best validation accuracy is returned by the lda method  (**88.235 %**).
+\newpage
+***5. Conclusion:***
+This report presented the development and results of the algorithm used to predict the economic performance of countries based on the World Bank's economic data set. The best results were produced using the lda method of classification. The results are, at a first glance, fine, although they do raise several relevant questions and offer additional improvement possibilities. These are stated below.
+
+1. The final data set is quite small. It begins at **`r no_at_beginning`**, but after removing all the empty values, ends at **`r no_at_end`**. This limits the quality of the algorithms produced, possibility of additional/advanced methods used etc. It also removes most of the developed world from the data set, leaving mostly developing states. Thus, if certain columns currently in use would be dropped or the limitations of the specific models regarding non existent data be otherwise circumvented, more data could be made available, improving the models.
+2. Referring to point 1 above, hyperparameters could be used to refine individual models. Additionaly, an ensemble of the models could be created, further increasing the accuracy of the overall model.
+3. As seen in the data visualizations, certain states only appear in the middle of the data interval used, which can skew the algorithms. These states or the problematic economic indicators should potentionally be excluded.
+4. The last three economic indicators (reserves, current account balance and external debt) are all in absolute dollar terms. Perhaps these should be transformed into the share in GDP, to maintain data cohesiveness (other indicators are in shares, not absolute numbers).
+5. Only one inflation indicator should be kept?
+6. Recode states into developed, medium, developing?
+7. Eventually, the data source could be changed, so that more granular data are obtained (recessions are generally based on quarterly data, not yearly data). This would entail massive changes to the foundations of this model. In this eventuality, only data from previous quarter could be used (predicting downturns based on concurrent data is not as useful as being able to predict them in advance).
+8. Aesthetically, all the gdp should either be upper or lower case. Also, why are the last two model results (decision tree and random forest) in the table 'results' in quotes, preventing any calculations with them?
+
+
+Best regard,
+
+Matej Sebenik  
+Ljubljana  
+Slovenia  
+EU  
